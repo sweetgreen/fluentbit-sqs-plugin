@@ -1,5 +1,3 @@
-version: "2"
-
 run:
   timeout: 5m
 
@@ -11,11 +9,11 @@ linters:
     - staticcheck
     - unused
 
-  settings:
-    staticcheck:
-      checks:
-        - "all"
-        - "-SA1019"
+linters-settings:
+  staticcheck:
+    checks:
+      - "all"
+      - "-SA1019"
 
 issues:
   exclude-rules:
