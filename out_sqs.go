@@ -34,10 +34,15 @@ var MessageCounter int = 0
 // SqsRecords is the actual aws messages batch
 var SqsRecords []*sqs.SendMessageBatchRequestEntry
 
+// sqsClient is an interface for SQS operations to enable testing
+type sqsClient interface {
+	SendMessageBatch(input *sqs.SendMessageBatchInput) (*sqs.SendMessageBatchOutput, error)
+}
+
 type sqsConfig struct {
 	queueURL            string
 	queueMessageGroupID string
-	mySQS               *sqs.SQS
+	mySQS               sqsClient
 	pluginTagAttribute  string
 	proxyURL            string
 	batchSize           int
@@ -83,7 +88,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	}
 
 	batchSize, err := strconv.Atoi(batchSizeString)
-	if err != nil || (0 > batchSize && batchSize > 10) {
+	if err != nil || batchSize < 1 || batchSize > 10 {
 		writeErrorLog(errors.New("BatchSize should be integer value between 1 and 10"))
 		return output.FLB_ERROR
 	}
@@ -153,7 +158,7 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 	sqsConf, ok := output.FLBPluginGetContext(ctx).(*sqsConfig)
 
 	if !ok {
-		writeErrorLog(errors.New("Unexpected error during get plugin context in flush function"))
+		writeErrorLog(errors.New("unexpected error during get plugin context in flush function"))
 		return output.FLB_ERROR
 	}
 
@@ -319,6 +324,32 @@ func setLogLevel() {
 	default:
 		sqsOutLogLevel = 1 // info
 	}
+}
+
+func validateBatchSize(batchSizeString string) bool {
+	batchSize, err := strconv.Atoi(batchSizeString)
+	if err != nil || batchSize < 1 || batchSize > 10 {
+		return false
+	}
+	return true
+}
+
+func validateQueueConfig(queueURL, queueRegion, queueMessageGroupID string) error {
+	if queueURL == "" {
+		return errors.New("QueueUrl configuration key is mandatory")
+	}
+
+	if queueRegion == "" {
+		return errors.New("QueueRegion configuration key is mandatory")
+	}
+
+	if strings.HasSuffix(queueURL, ".fifo") {
+		if queueMessageGroupID == "" {
+			return errors.New("QueueMessageGroupId configuration key is mandatory for FIFO queues")
+		}
+	}
+
+	return nil
 }
 
 func main() {
