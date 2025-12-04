@@ -232,6 +232,8 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 		if sqsConf.queueMessageGroupID != "" {
 			sqsRecord.MessageGroupId = aws.String(sqsConf.queueMessageGroupID)
+			// Add MessageDeduplicationId for FIFO queues to prevent deduplication
+			sqsRecord.MessageDeduplicationId = aws.String(fmt.Sprintf("MessageNumber-%d-%d", MessageCounter, timeStamp.UnixNano()))
 		}
 
 		SqsRecords = append(SqsRecords, sqsRecord)

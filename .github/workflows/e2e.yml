@@ -104,10 +104,10 @@ jobs:
           echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_ENV
           echo "✓ Created standard queue: $QUEUE_URL"
 
-          # Create FIFO queue
+          # Create FIFO queue (disable content-based deduplication for testing)
           FIFO_QUEUE_URL=$(aws --endpoint-url=http://localhost:4566 sqs create-queue \
             --queue-name test-queue.fifo \
-            --attributes FifoQueue=true \
+            --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false"}' \
             --output text \
             --query 'QueueUrl')
           echo "FIFO_QUEUE_URL=$FIFO_QUEUE_URL" >> $GITHUB_ENV
@@ -189,8 +189,8 @@ jobs:
           # Kill Fluent Bit if still running
           sudo kill $FB_PID 2>/dev/null || true
 
-          # Give it a moment to clean up
-          sleep 2
+          # Give it a moment to clean up and for messages to propagate to SQS
+          sleep 5
 
           echo "✓ Fluent Bit execution completed (standard queue)"
 
@@ -272,8 +272,8 @@ jobs:
           # Kill Fluent Bit if still running
           sudo kill $FB_PID 2>/dev/null || true
 
-          # Give it a moment to clean up
-          sleep 2
+          # Give it a moment to clean up and for messages to propagate to SQS
+          sleep 5
 
           echo "✓ Fluent Bit execution completed (FIFO queue)"
 
