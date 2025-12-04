@@ -21,7 +21,7 @@ jobs:
         ports:
           - 4566:4566
         options: >-
-          --health-cmd "awslocal sqs list-queues || exit 1"
+          --health-cmd "curl -f http://localhost:4566/_localstack/health || exit 1"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -36,10 +36,13 @@ jobs:
           go-version: '1.21'
           cache: true
 
-      - name: Install AWS CLI and tools
+      - name: Install tools
         run: |
+          # AWS CLI v2 is pre-installed on ubuntu-latest, verify it
+          aws --version
+          # Install jq for JSON parsing
           sudo apt-get update
-          sudo apt-get install -y awscli jq
+          sudo apt-get install -y jq
 
       - name: Download dependencies
         run: go mod download
@@ -53,15 +56,33 @@ jobs:
       - name: Install Fluent Bit
         run: |
           # Install Fluent Bit from official repository
-          curl https://raw.githubusercontent.com/fluent/fluent-bit/master/install.sh | sh
+          curl -fsSL https://raw.githubusercontent.com/fluent/fluent-bit/master/install.sh | sudo sh
 
           # Verify installation
-          /opt/fluent-bit/bin/fluent-bit --version
+          which fluent-bit || /opt/fluent-bit/bin/fluent-bit --version
+
+          # Find fluent-bit installation
+          if [ -x "/opt/fluent-bit/bin/fluent-bit" ]; then
+            FB_BIN="/opt/fluent-bit/bin/fluent-bit"
+            FB_PLUGINS="/opt/fluent-bit/plugins"
+          elif [ -x "/usr/local/bin/fluent-bit" ]; then
+            FB_BIN="/usr/local/bin/fluent-bit"
+            FB_PLUGINS="/usr/local/lib/fluent-bit"
+          else
+            FB_BIN="fluent-bit"
+            FB_PLUGINS="/usr/lib/fluent-bit"
+          fi
+
+          echo "FB_BIN=$FB_BIN" >> $GITHUB_ENV
+          echo "FB_PLUGINS=$FB_PLUGINS" >> $GITHUB_ENV
 
           # Copy plugin to Fluent Bit plugins directory
-          sudo mkdir -p /opt/fluent-bit/plugins
-          sudo cp out_sqs.so /opt/fluent-bit/plugins/
-          echo "✓ Fluent Bit installed and plugin copied"
+          sudo mkdir -p "$FB_PLUGINS"
+          sudo cp out_sqs.so "$FB_PLUGINS/"
+
+          echo "✓ Fluent Bit installed at: $FB_BIN"
+          echo "✓ Plugin copied to: $FB_PLUGINS"
+          $FB_BIN --version
 
       - name: Wait for LocalStack
         run: |
@@ -165,9 +186,11 @@ jobs:
           SQS_OUT_LOG_LEVEL: debug
         run: |
           echo "Starting Fluent Bit with standard queue..."
-          timeout 30 sudo -E /opt/fluent-bit/bin/fluent-bit \
+          echo "Using Fluent Bit: $FB_BIN"
+          echo "Plugin location: $FB_PLUGINS/out_sqs.so"
+          timeout 30 sudo -E $FB_BIN \
             -c /tmp/fluent-bit-standard.conf \
-            -e /opt/fluent-bit/plugins/out_sqs.so || true
+            -e $FB_PLUGINS/out_sqs.so || true
 
           echo "✓ Fluent Bit execution completed (standard queue)"
 
@@ -243,9 +266,11 @@ jobs:
           SQS_OUT_LOG_LEVEL: debug
         run: |
           echo "Starting Fluent Bit with FIFO queue..."
-          timeout 30 sudo -E /opt/fluent-bit/bin/fluent-bit \
+          echo "Using Fluent Bit: $FB_BIN"
+          echo "Plugin location: $FB_PLUGINS/out_sqs.so"
+          timeout 30 sudo -E $FB_BIN \
             -c /tmp/fluent-bit-fifo.conf \
-            -e /opt/fluent-bit/plugins/out_sqs.so || true
+            -e $FB_PLUGINS/out_sqs.so || true
 
           echo "✓ Fluent Bit execution completed (FIFO queue)"
 
