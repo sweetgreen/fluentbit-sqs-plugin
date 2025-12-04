@@ -62,6 +62,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	pluginTagAttribute := output.FLBPluginConfigKey(plugin, "PluginTagAttribute")
 	proxyURL := output.FLBPluginConfigKey(plugin, "ProxyUrl")
 	batchSizeString := output.FLBPluginConfigKey(plugin, "BatchSize")
+	endpoint := output.FLBPluginConfigKey(plugin, "Endpoint")
 
 	writeInfoLog(fmt.Sprintf("QueueUrl is: %s", queueURL))
 	writeInfoLog(fmt.Sprintf("QueueRegion is: %s", queueRegion))
@@ -69,6 +70,7 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 	writeInfoLog(fmt.Sprintf("pluginTagAttribute is: %s", pluginTagAttribute))
 	writeInfoLog(fmt.Sprintf("ProxyUrl is: %s", proxyURL))
 	writeInfoLog(fmt.Sprintf("BatchSize is: %s", batchSizeString))
+	writeInfoLog(fmt.Sprintf("Endpoint is: %s", endpoint))
 
 	if queueURL == "" {
 		writeErrorLog(errors.New("QueueUrl configuration key is mandatory"))
@@ -114,6 +116,12 @@ func FLBPluginInit(plugin unsafe.Pointer) int {
 			CredentialsChainVerboseErrors: aws.Bool(true),
 			Credentials:                   awsCredentials,
 		}
+	}
+
+	// Set custom endpoint if provided (useful for testing with LocalStack)
+	if endpoint != "" {
+		writeInfoLog(fmt.Sprintf("using custom endpoint: %s", endpoint))
+		awsConfig.Endpoint = aws.String(endpoint)
 	}
 
 	// if proxy
@@ -224,6 +232,8 @@ func FLBPluginFlushCtx(ctx, data unsafe.Pointer, length C.int, tag *C.char) int 
 
 		if sqsConf.queueMessageGroupID != "" {
 			sqsRecord.MessageGroupId = aws.String(sqsConf.queueMessageGroupID)
+			// Add MessageDeduplicationId for FIFO queues to prevent deduplication
+			sqsRecord.MessageDeduplicationId = aws.String(fmt.Sprintf("MessageNumber-%d-%d", MessageCounter, timeStamp.UnixNano()))
 		}
 
 		SqsRecords = append(SqsRecords, sqsRecord)

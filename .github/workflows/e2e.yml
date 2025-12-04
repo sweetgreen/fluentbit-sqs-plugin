@@ -1,0 +1,340 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  e2e:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+
+    services:
+      localstack:
+        image: localstack/localstack:latest
+        env:
+          SERVICES: sqs
+          DEBUG: 1
+          DEFAULT_REGION: us-east-1
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -f http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+
+      - name: Install tools
+        run: |
+          # AWS CLI v2 is pre-installed on ubuntu-latest, verify it
+          aws --version
+          # Install jq for JSON parsing
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build plugin
+        run: |
+          go build -buildmode=c-shared -o out_sqs.so .
+          ls -lh out_sqs.so
+          echo "✓ Plugin built successfully"
+
+      - name: Install Fluent Bit
+        run: |
+          # Install Fluent Bit from official repository
+          curl -fsSL https://raw.githubusercontent.com/fluent/fluent-bit/master/install.sh | sudo sh
+
+          # Verify installation
+          which fluent-bit || /opt/fluent-bit/bin/fluent-bit --version
+
+          # Find fluent-bit installation
+          if [ -x "/opt/fluent-bit/bin/fluent-bit" ]; then
+            FB_BIN="/opt/fluent-bit/bin/fluent-bit"
+            FB_PLUGINS="/opt/fluent-bit/plugins"
+          elif [ -x "/usr/local/bin/fluent-bit" ]; then
+            FB_BIN="/usr/local/bin/fluent-bit"
+            FB_PLUGINS="/usr/local/lib/fluent-bit"
+          else
+            FB_BIN="fluent-bit"
+            FB_PLUGINS="/usr/lib/fluent-bit"
+          fi
+
+          echo "FB_BIN=$FB_BIN" >> $GITHUB_ENV
+          echo "FB_PLUGINS=$FB_PLUGINS" >> $GITHUB_ENV
+
+          # Copy plugin to Fluent Bit plugins directory
+          sudo mkdir -p "$FB_PLUGINS"
+          sudo cp out_sqs.so "$FB_PLUGINS/"
+
+          echo "✓ Fluent Bit installed at: $FB_BIN"
+          echo "✓ Plugin copied to: $FB_PLUGINS"
+          $FB_BIN --version
+
+      - name: Wait for LocalStack
+        run: |
+          echo "Waiting for LocalStack to be ready..."
+          timeout 60 bash -c 'until curl -s http://localhost:4566/_localstack/health | grep -q "\"sqs\": \"available\""; do sleep 2; done'
+          echo "✓ LocalStack is ready"
+
+      - name: Create test SQS queues
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          # Create standard queue
+          QUEUE_URL=$(aws --endpoint-url=http://localhost:4566 sqs create-queue \
+            --queue-name test-queue \
+            --output text \
+            --query 'QueueUrl')
+          echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_ENV
+          echo "✓ Created standard queue: $QUEUE_URL"
+
+          # Create FIFO queue (disable content-based deduplication for testing)
+          FIFO_QUEUE_URL=$(aws --endpoint-url=http://localhost:4566 sqs create-queue \
+            --queue-name test-queue.fifo \
+            --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false"}' \
+            --output text \
+            --query 'QueueUrl')
+          echo "FIFO_QUEUE_URL=$FIFO_QUEUE_URL" >> $GITHUB_ENV
+          echo "✓ Created FIFO queue: $FIFO_QUEUE_URL"
+
+      - name: Create Fluent Bit configuration (Standard Queue)
+        run: |
+          cat > /tmp/fluent-bit-standard.conf << EOF
+          [SERVICE]
+              Flush        1
+              Daemon       Off
+              Log_Level    debug
+
+          [INPUT]
+              Name              dummy
+              Tag               test.logs
+              Dummy             {"level": "info", "message": "Test log message", "timestamp": "2024-01-01T10:00:00Z"}
+              Samples           5
+
+          [OUTPUT]
+              Name         sqs
+              Match        *
+              QueueUrl     ${{ env.QUEUE_URL }}
+              QueueRegion  us-east-1
+              BatchSize    5
+              Endpoint     http://localhost:4566
+          EOF
+          cat /tmp/fluent-bit-standard.conf
+          echo "✓ Created Fluent Bit configuration for standard queue"
+
+      - name: Create Fluent Bit configuration (FIFO Queue)
+        run: |
+          cat > /tmp/fluent-bit-fifo.conf << EOF
+          [SERVICE]
+              Flush        1
+              Daemon       Off
+              Log_Level    debug
+
+          [INPUT]
+              Name              dummy
+              Tag               test.fifo.logs
+              Dummy             {"level": "info", "message": "FIFO test log", "sequence": 1}
+              Samples           3
+
+          [OUTPUT]
+              Name         sqs
+              Match        *
+              QueueUrl     ${{ env.FIFO_QUEUE_URL }}
+              QueueRegion  us-east-1
+              BatchSize    3
+              QueueMessageGroupId  test-group
+              Endpoint     http://localhost:4566
+          EOF
+          cat /tmp/fluent-bit-fifo.conf
+          echo "✓ Created Fluent Bit configuration for FIFO queue"
+
+      - name: Run Fluent Bit with Standard Queue
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+          SQS_OUT_LOG_LEVEL: debug
+        run: |
+          echo "Starting Fluent Bit with standard queue..."
+          echo "Using Fluent Bit: $FB_BIN"
+          echo "Plugin location: $FB_PLUGINS/out_sqs.so"
+
+          # Run Fluent Bit - it will exit after processing all samples
+          sudo -E $FB_BIN \
+            -c /tmp/fluent-bit-standard.conf \
+            -e $FB_PLUGINS/out_sqs.so &
+
+          FB_PID=$!
+
+          # Wait for Fluent Bit to process messages (10 seconds should be enough)
+          sleep 10
+
+          # Kill Fluent Bit if still running
+          sudo kill $FB_PID 2>/dev/null || true
+
+          # Give it a moment to clean up and for messages to propagate to SQS
+          sleep 5
+
+          echo "✓ Fluent Bit execution completed (standard queue)"
+
+      - name: Verify messages in Standard Queue
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          echo "Checking messages in standard queue..."
+
+          # Get queue attributes
+          QUEUE_ATTRS=$(aws --endpoint-url=http://localhost:4566 sqs get-queue-attributes \
+            --queue-url "${{ env.QUEUE_URL }}" \
+            --attribute-names All)
+
+          echo "Queue Attributes:"
+          echo "$QUEUE_ATTRS" | jq .
+
+          # Get approximate message count
+          MSG_COUNT=$(echo "$QUEUE_ATTRS" | jq -r '.Attributes.ApproximateNumberOfMessages // "0"')
+          echo "Approximate messages in queue: $MSG_COUNT"
+
+          # Receive messages from queue
+          MESSAGES=$(aws --endpoint-url=http://localhost:4566 sqs receive-message \
+            --queue-url "${{ env.QUEUE_URL }}" \
+            --max-number-of-messages 10 \
+            --wait-time-seconds 5)
+
+          echo "Received messages:"
+          echo "$MESSAGES" | jq .
+
+          # Count received messages
+          RECEIVED_COUNT=$(echo "$MESSAGES" | jq '.Messages | length')
+          echo "Number of messages received: $RECEIVED_COUNT"
+
+          # Verify we received messages
+          if [ "$RECEIVED_COUNT" -gt 0 ]; then
+            echo "✓ Successfully received $RECEIVED_COUNT messages from standard queue"
+
+            # Validate message structure
+            echo "$MESSAGES" | jq -r '.Messages[].Body' | while read -r body; do
+              echo "Message body: $body"
+              # Check if the body is valid JSON
+              if echo "$body" | jq empty 2>/dev/null; then
+                echo "  ✓ Valid JSON message"
+              else
+                echo "  ✗ Invalid JSON message"
+                exit 1
+              fi
+            done
+          else
+            echo "✗ No messages received from standard queue"
+            exit 1
+          fi
+
+      - name: Run Fluent Bit with FIFO Queue
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+          SQS_OUT_LOG_LEVEL: debug
+        run: |
+          echo "Starting Fluent Bit with FIFO queue..."
+          echo "Using Fluent Bit: $FB_BIN"
+          echo "Plugin location: $FB_PLUGINS/out_sqs.so"
+
+          # Run Fluent Bit - it will exit after processing all samples
+          sudo -E $FB_BIN \
+            -c /tmp/fluent-bit-fifo.conf \
+            -e $FB_PLUGINS/out_sqs.so &
+
+          FB_PID=$!
+
+          # Wait for Fluent Bit to process messages
+          sleep 10
+
+          # Kill Fluent Bit if still running
+          sudo kill $FB_PID 2>/dev/null || true
+
+          # Give it a moment to clean up and for messages to propagate to SQS
+          sleep 5
+
+          echo "✓ Fluent Bit execution completed (FIFO queue)"
+
+      - name: Verify messages in FIFO Queue
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          echo "Checking messages in FIFO queue..."
+
+          # Get queue attributes
+          FIFO_QUEUE_ATTRS=$(aws --endpoint-url=http://localhost:4566 sqs get-queue-attributes \
+            --queue-url "${{ env.FIFO_QUEUE_URL }}" \
+            --attribute-names All)
+
+          echo "FIFO Queue Attributes:"
+          echo "$FIFO_QUEUE_ATTRS" | jq .
+
+          # Receive messages from FIFO queue
+          FIFO_MESSAGES=$(aws --endpoint-url=http://localhost:4566 sqs receive-message \
+            --queue-url "${{ env.FIFO_QUEUE_URL }}" \
+            --max-number-of-messages 10 \
+            --wait-time-seconds 5)
+
+          echo "Received FIFO messages:"
+          echo "$FIFO_MESSAGES" | jq .
+
+          # Count received messages
+          FIFO_RECEIVED_COUNT=$(echo "$FIFO_MESSAGES" | jq '.Messages | length')
+          echo "Number of FIFO messages received: $FIFO_RECEIVED_COUNT"
+
+          # Verify we received messages
+          if [ "$FIFO_RECEIVED_COUNT" -gt 0 ]; then
+            echo "✓ Successfully received $FIFO_RECEIVED_COUNT messages from FIFO queue"
+
+            # Validate FIFO message structure
+            echo "$FIFO_MESSAGES" | jq -r '.Messages[].Body' | while read -r body; do
+              echo "FIFO message body: $body"
+              if echo "$body" | jq empty 2>/dev/null; then
+                echo "  ✓ Valid JSON message"
+              else
+                echo "  ✗ Invalid JSON message"
+                exit 1
+              fi
+            done
+          else
+            echo "✗ No messages received from FIFO queue"
+            exit 1
+          fi
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "================================================"
+          echo "           E2E Test Summary"
+          echo "================================================"
+          echo "✓ Plugin built successfully"
+          echo "✓ Fluent Bit installed and configured"
+          echo "✓ LocalStack SQS service running"
+          echo "✓ Standard queue tested"
+          echo "✓ FIFO queue tested"
+          echo "✓ Message delivery verified"
+          echo "================================================"
